@@ -2,15 +2,16 @@ import requests
 from bs4 import BeautifulSoup
 import time
 import os
+import schedule
 
 TOKEN = "8517153978:AAGNMGbzhu-saXIRqvbXMG0Vn56AbbcHxOY"
 CHAT_ID = "@TREEDSTL"
 
 def generate_visual_description(img_url, title, raw_desc):
     templates = [
-        "📦 *{}*\n\nОтличная модель для 3D-печати. {} — это стильный и функциональный предмет. Рекомендуется печатать с заполнением 20% и слоем 0.2 мм. Идеально подойдёт для дома или офиса.",
-        "📦 *{}*\n\nПотрясающий дизайн! {} легко печатается и выглядит профессионально. Добавьте эту модель в свою коллекцию.",
-        "📦 *{}*\n\nПрактичная и красивая модель. {} станет отличным дополнением вашего интерьера. Печатается без поддержек."
+        "📦 *{}*\n\nОтличная модель для 3D-печати. {} — это стильный и функциональный предмет. Рекомендуется печатать с заполнением 20% и слоем 0.2 мм.",
+        "📦 *{}*\n\nПотрясающий дизайн! {} легко печатается и выглядит профессионально.",
+        "📦 *{}*\n\nПрактичная и красивая модель. {} станет отличным дополнением вашего интерьера."
     ]
     import random
     template = random.choice(templates)
@@ -56,62 +57,6 @@ def get_printables_model():
         print(f"Printables error: {e}")
         return None
 
-def get_thingiverse_model():
-    url = "https://www.thingiverse.com/"
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"}
-    try:
-        response = requests.get(url, headers=headers)
-        soup = BeautifulSoup(response.text, "html.parser")
-        model_links = [a for a in soup.find_all("a", href=True) if "/thing:" in a["href"]]
-        if not model_links: return None
-        unique_urls = []
-        for a in model_links:
-            href = a["href"]
-            if not href.startswith("http"): href = "https://www.thingiverse.com" + href
-            if href not in unique_urls: unique_urls.append(href)
-        model_url = None
-        for test_url in unique_urls:
-            if not is_already_posted(test_url):
-                model_url = test_url
-                break
-        if not model_url: return None
-        print(f"Visiting Thingiverse model: {model_url}")
-        detail_res = requests.get(model_url, headers=headers)
-        detail_soup = BeautifulSoup(detail_res.text, "html.parser")
-        title = detail_soup.find("h1").get_text(strip=True) if detail_soup.find("h1") else "3D Model"
-        desc_div = detail_soup.find("div", class_="thing-description") or detail_soup.find("div", class_="description") or detail_soup.find("div", id="description")
-        raw_description = desc_div.get_text(strip=True) if desc_div else "No description available."
-        img_url = None
-        og_image = detail_soup.find("meta", property="og:image")
-        if og_image:
-            img_url = og_image["content"]
-            if "/renders/" in img_url:
-                img_url = img_url.replace("/card/", "/large/").replace("/thumb/", "/large/")
-        else:
-            img_tags = detail_soup.find_all("img")
-            for img in img_tags:
-                src = img.get("src", "")
-                if "cdn.thingiverse.com" in src:
-                    img_url = src.replace("/card/", "/large/").replace("/thumb/", "/large/")
-                    break
-        description = generate_visual_description(img_url, title, raw_description) if img_url else raw_description[:300]
-        return {"title": title, "url": model_url, "description": description, "image": img_url}
-    except Exception as e:
-        print(f"Thingiverse error: {e}")
-        return None
-
-def get_trending_model():
-    import random
-    source = random.choice(["printables", "thingiverse"])
-    print(f"Selected source: {source}")
-    if source == "printables":
-        model = get_printables_model()
-        if not model: model = get_thingiverse_model()
-    else:
-        model = get_thingiverse_model()
-        if not model: model = get_printables_model()
-    return model
-
 def is_already_posted(url):
     history_file = "posted_models.txt"
     if not os.path.exists(history_file):
@@ -152,6 +97,8 @@ def post_to_telegram(model):
     caption += f"{model['description']}\n\n"
     caption += f"🔗 [Источник]({model['url']})\n\n"
     caption += "#3D #3Dпечать #STL #модель #3Dprinting #DIY"
+    
+    # Отправляем фото
     if model["image"]:
         url = f"https://api.telegram.org/bot{TOKEN}/sendPhoto"
         data = {"chat_id": CHAT_ID, "photo": model["image"], "caption": caption, "parse_mode": "Markdown"}
@@ -160,7 +107,9 @@ def post_to_telegram(model):
         url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
         data = {"chat_id": CHAT_ID, "text": caption, "parse_mode": "Markdown"}
         res = requests.post(url, data=data).json()
+    
     if res.get("ok"):
+        # Скачиваем STL/ZIP
         file_url = None
         if "printables.com" in model["url"]:
             model_id = model["url"].split("/")[-1].split("-")[0]
@@ -169,7 +118,6 @@ def post_to_telegram(model):
             thing_id = model["url"].split(":")[-1]
             file_url = f"https://www.thingiverse.com/thing:{thing_id}/zip"
         if file_url:
-            print(f"Attempting to download file from {file_url}")
             file_path = download_file(file_url, f"{model['title'][:30]}.zip")
             if file_path and os.path.getsize(file_path) < 50 * 1024 * 1024:
                 url = f"https://api.telegram.org/bot{TOKEN}/sendDocument"
@@ -181,26 +129,34 @@ def post_to_telegram(model):
                 os.remove(file_path)
     return res
 
-if __name__ == "__main__":
-    posted_success = False
-    for i in range(5):
-        model = get_trending_model()
-        if model:
-            print(f"Found model: {model['title']}")
-            result = post_to_telegram(model)
-            if result and result.get("ok"):
-                mark_as_posted(model["url"])
-                print("Post result: Success")
-                posted_success = True
-                break
-            elif result is None:
-                print("Trying another model...")
-                continue
-            else:
-                print("Post result error:", result)
-                break
+def job():
+    print(f"⏰ {time.strftime('%H:%M')} - Запуск поиска модели...")
+    model = get_printables_model()
+    if model:
+        print(f"Found model: {model['title']}")
+        result = post_to_telegram(model)
+        if result and result.get("ok"):
+            mark_as_posted(model["url"])
+            print("✅ Пост опубликован!")
         else:
-            print("Failed to get model info.")
-            break
-    if not posted_success:
-        print("Could not post any unique model after multiple attempts.")
+            print("❌ Ошибка публикации")
+    else:
+        print("❌ Модель не найдена")
+
+if __name__ == "__main__":
+    # Расписание: каждый час с 9:00 до 18:00
+    schedule.every().day.at("09:00").do(job)
+    schedule.every().day.at("10:00").do(job)
+    schedule.every().day.at("11:00").do(job)
+    schedule.every().day.at("12:00").do(job)
+    schedule.every().day.at("13:00").do(job)
+    schedule.every().day.at("14:00").do(job)
+    schedule.every().day.at("15:00").do(job)
+    schedule.every().day.at("16:00").do(job)
+    schedule.every().day.at("17:00").do(job)
+    schedule.every().day.at("18:00").do(job)
+    
+    print("🚀 Бот запущен. Жду расписания (9:00–18:00)")
+    while True:
+        schedule.run_pending()
+        time.sleep(1)
