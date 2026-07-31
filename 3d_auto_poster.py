@@ -3,6 +3,8 @@ from bs4 import BeautifulSoup
 import time
 import os
 import schedule
+import threading
+import socket
 
 TOKEN = "8517153978:AAGNMGbzhu-saXIRqvbXMG0Vn56AbbcHxOY"
 CHAT_ID = "@TREEDSTL"
@@ -43,7 +45,6 @@ def generate_visual_description(img_url, title, raw_desc, model_url):
     # Финальное объединение
     description = f"{header}\n\n{body}{highlights}\n\n{tips}\n🔗 [Источник]({model_url})\n\n#3D #3Dпечать #STL #модель #3Dprinting #DIY"
     return description
-
 
 def get_printables_model():
     url = "https://www.printables.com/model?period=day&sort=trending"
@@ -94,7 +95,6 @@ def get_printables_model():
         print(f"Printables error: {e}")
         return None
 
-
 def is_already_posted(url):
     history_file = "posted_models.txt"
     if not os.path.exists(history_file):
@@ -103,12 +103,10 @@ def is_already_posted(url):
         posted = f.read().splitlines()
     return url in posted
 
-
 def mark_as_posted(url):
     history_file = "posted_models.txt"
     with open(history_file, "a") as f:
         f.write(url + "\n")
-
 
 def download_file(url, filename):
     headers = {"User-Agent": "Mozilla/5.0"}
@@ -125,7 +123,6 @@ def download_file(url, filename):
     except Exception as e:
         print(f"Download error: {e}")
         return None
-
 
 def post_to_telegram(model):
     if not model:
@@ -168,7 +165,6 @@ def post_to_telegram(model):
                 os.remove(file_path)
     return res
 
-
 def job():
     print(f"⏰ {time.strftime('%H:%M')} - Запуск поиска модели...")
     model = get_printables_model()
@@ -183,8 +179,22 @@ def job():
     else:
         print("❌ Модель не найдена")
 
+def fake_server():
+    """Фейковый сервер для Render, чтобы он не перезапускал бота"""
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.bind(('0.0.0.0', 8080))
+        sock.listen(1)
+        print("🟢 Фейковый порт 8080 открыт для Render (защита от перезапусков)")
+        while True:
+            sock.accept()
+    except Exception as e:
+        print(f"⚠️ Фейковый порт: {e}")
 
 if __name__ == "__main__":
+    # Запускаем фейковый сервер в отдельном потоке
+    threading.Thread(target=fake_server, daemon=True).start()
+    
     # Расписание: каждый час с 9:00 до 18:00
     schedule.every().day.at("09:00").do(job)
     schedule.every().day.at("10:00").do(job)
