@@ -4,13 +4,21 @@ import time
 import os
 import schedule
 import threading
-import socket
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 TOKEN = "8517153978:AAGNMGbzhu-saXIRqvbXMG0Vn56AbbcHxOY"
 CHAT_ID = "@TREEDSTL"
 
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot is running")
+    
+    def log_message(self, format, *args):
+        return
+
 def generate_visual_description(img_url, title, raw_desc, model_url):
-    # Автоматический подбор заголовка по типу модели
     if "organizer" in title.lower() or "drawer" in title.lower():
         header = f"⚡ {title}: Стильный органайзер в духе Mid-Century Modern!"
     elif "vase" in title.lower():
@@ -22,27 +30,23 @@ def generate_visual_description(img_url, title, raw_desc, model_url):
     else:
         header = f"✨ {title}: Уникальная 3D-модель для вашего дома"
 
-    # Основной текст (берём из сырого описания, если есть)
     if raw_desc and len(raw_desc) > 50:
         body = f"{raw_desc}\n\n"
     else:
         body = "Если ваш рабочий стол завален мелочевкой, эта модульная система — спасение. Сочетает в себе эстетику ретро-футуризма и строгую функциональность.\n\n"
 
-    # Блок "Почему это круто"
     highlights = (
         "✅ **Модульность:** Собирайте конфигурацию под свои нужды, наращивая ярусы.\n"
         "✅ **Эстетика:** Чистые линии превратят обычный пластик в элемент декора.\n"
         "✅ **Практичность:** Идеально подходит для организации пространства в прихожей или на столе.\n"
     )
 
-    # Блок "Советы по печати"
     tips = (
         "💡 **Советы по печати:**\n"
-        "• 🧵 **Материал:** Используйте матовый PLA или текстурированный PETG — они лучше всего поддерживают форму и скрывают слои.\n"
+        "• 🧵 **Материал:** Используйте матовый PLA или текстурированный PETG.\n"
         "• 🔥 **Точность:** Тщательно откалибруйте поток (flow), чтобы модули легко стыковались.\n"
     )
 
-    # Финальное объединение
     description = f"{header}\n\n{body}{highlights}\n\n{tips}\n🔗 [Источник]({model_url})\n\n#3D #3Dпечать #STL #модель #3Dprinting #DIY"
     return description
 
@@ -134,7 +138,6 @@ def post_to_telegram(model):
 
     caption = model["description"]
     
-    # Отправляем фото
     if model["image"]:
         url = f"https://api.telegram.org/bot{TOKEN}/sendPhoto"
         data = {"chat_id": CHAT_ID, "photo": model["image"], "caption": caption, "parse_mode": "Markdown"}
@@ -145,7 +148,6 @@ def post_to_telegram(model):
         res = requests.post(url, data=data).json()
     
     if res.get("ok"):
-        # Скачиваем STL/ZIP
         file_url = None
         if "printables.com" in model["url"]:
             model_id = model["url"].split("/")[-1].split("-")[0]
@@ -179,33 +181,16 @@ def job():
     else:
         print("❌ Модель не найдена")
 
-def fake_server():
-    """Фейковый сервер для Render, чтобы он не перезапускал бота"""
-    try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.bind(('0.0.0.0', 8080))
-        sock.listen(1)
-        print("🟢 Фейковый порт 8080 открыт для Render (защита от перезапусков)")
-        while True:
-            sock.accept()
-    except Exception as e:
-        print(f"⚠️ Фейковый порт: {e}")
+def run_webserver():
+    server = HTTPServer(('0.0.0.0', 10000), HealthHandler)
+    print("🌐 Веб-сервер запущен на порту 10000 (для Render)")
+    server.serve_forever()
 
 if __name__ == "__main__":
-    # --- ОТКРЫВАЕМ ПОРТ В ГЛАВНОМ ПОТОКЕ (Render увидит сразу) ---
-    try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.bind(('0.0.0.0', 8080))
-        sock.listen(1)
-        print("🟢 Порт 8080 открыт в главном потоке. Render увидит и успокоится.")
-        # Запускаем accept в фоновом потоке, чтобы не блокировать расписание
-        threading.Thread(target=lambda: sock.accept(), daemon=True).start()
-    except Exception as e:
-        print(f"⚠️ Ошибка открытия порта: {e}")
-    # --- КОНЕЦ БЛОКА ---
-
-    # Расписание: каждый час с 9:00 до 18:00
+    # Запускаем веб-сервер в отдельном потоке (он будет отвечать Render'у)
+    threading.Thread(target=run_webserver, daemon=True).start()
+    
+    # Расписание
     schedule.every().day.at("09:00").do(job)
     schedule.every().day.at("10:00").do(job)
     schedule.every().day.at("11:00").do(job)
@@ -221,4 +206,3 @@ if __name__ == "__main__":
     while True:
         schedule.run_pending()
         time.sleep(1)
-        
