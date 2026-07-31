@@ -192,9 +192,19 @@ def fake_server():
         print(f"⚠️ Фейковый порт: {e}")
 
 if __name__ == "__main__":
-    # Запускаем фейковый сервер в отдельном потоке
-    threading.Thread(target=fake_server, daemon=True).start()
-    
+    # --- ОТКРЫВАЕМ ПОРТ В ГЛАВНОМ ПОТОКЕ (Render увидит сразу) ---
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(('0.0.0.0', 8080))
+        sock.listen(1)
+        print("🟢 Порт 8080 открыт в главном потоке. Render увидит и успокоится.")
+        # Запускаем accept в фоновом потоке, чтобы не блокировать расписание
+        threading.Thread(target=lambda: sock.accept(), daemon=True).start()
+    except Exception as e:
+        print(f"⚠️ Ошибка открытия порта: {e}")
+    # --- КОНЕЦ БЛОКА ---
+
     # Расписание: каждый час с 9:00 до 18:00
     schedule.every().day.at("09:00").do(job)
     schedule.every().day.at("10:00").do(job)
@@ -211,3 +221,4 @@ if __name__ == "__main__":
     while True:
         schedule.run_pending()
         time.sleep(1)
+        
