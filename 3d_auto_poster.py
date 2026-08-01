@@ -70,6 +70,8 @@ def get_printables_model():
         if not model_url:
             return None
         
+        time.sleep(3)  # Ждём 3 секунды, чтобы описание успело подгрузиться
+        
         detail_res = requests.get(model_url, headers=headers)
         detail_soup = BeautifulSoup(detail_res.text, "html.parser")
         title = detail_soup.find("h1").get_text(strip=True) if detail_soup.find("h1") else "3D Model"
