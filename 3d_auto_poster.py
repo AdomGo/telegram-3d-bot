@@ -5,10 +5,12 @@ import os
 import schedule
 import threading
 import random
+import base64
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 TOKEN = "8517153978:AAGNMGbzhu-saXIRqvbXMG0Vn56AbbcHxOY"
 CHAT_ID = "@TREEDSTL"
+GEMINI_API_KEY = "AQ.Ab8RN6Jf_AL-Umq704uEktnHJff5v8wshOu1kTHhI8AMT4AGrg"
 
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -19,14 +21,46 @@ class HealthHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         return
 
-def generate_visual_description(title):
-    # Генерируем описание на основе названия (без картинки)
-    templates = [
-        f"📦 *{title}*\n\nОтличная модель для 3D-печати. {title} — это стильный и функциональный предмет. Рекомендуется печатать с заполнением 20% и слоем 0.2 мм.\n\n✅ **Практичность:** Идеально подходит для дома или офиса.\n✅ **Эстетика:** Чистый дизайн.\n\n💡 **Совет:** Используйте матовый PLA.\n",
-        f"📦 *{title}*\n\nПотрясающий дизайн! {title} легко печатается и выглядит профессионально. Добавьте эту модель в свою коллекцию.\n\n✅ **Универсальность:** Подходит для любого интерьера.\n✅ **Простота:** Печатается без поддержек.\n\n💡 **Совет:** Слой 0.2 мм, заполнение 15%.\n",
-        f"📦 *{title}*\n\nПрактичная и красивая модель. {title} станет отличным дополнением вашего интерьера. Печатается без поддержек.\n\n✅ **Надёжность:** Прочная конструкция.\n✅ **Дизайн:** Современный минимализм.\n\n💡 **Совет:** Рекомендуется PETG для прочности.\n"
-    ]
-    return random.choice(templates)
+def generate_description_with_gemini(img_url, title):
+    """Генерирует описание по картинке через Google Gemini API"""
+    try:
+        # Сначала скачиваем картинку в base64
+        img_data = requests.get(img_url, timeout=15).content
+        img_b64 = base64.b64encode(img_data).decode('utf-8')
+        
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
+        
+        prompt = f"""Ты — эксперт по 3D-печати. Посмотри на эту картинку.
+Напиши красивое описание для Telegram-канала на русском языке для этой модели.
+Название модели: {title}
+
+Опиши:
+1. Что это за модель (кратко)
+2. Для чего она нужна
+3. Пару советов по печати (материал, слой, поддержки)
+
+Используй эмодзи, не пиши лишнего. Максимум 500 символов."""
+        
+        payload = {
+            "contents": [{
+                "parts": [
+                    {"text": prompt},
+                    {"inline_data": {"mime_type": "image/jpeg", "data": img_b64}}
+                ]
+            }]
+        }
+        
+        response = requests.post(url, json=payload, timeout=20)
+        data = response.json()
+        
+        if 'candidates' in data and len(data['candidates']) > 0:
+            text = data['candidates'][0]['content']['parts'][0]['text']
+            return text.strip()
+        else:
+            return f"📦 *{title}*\n\nОтличная 3D-модель. Рекомендуется для печати."
+    except Exception as e:
+        print(f"Gemini error: {e}")
+        return f"📦 *{title}*\n\nМодель для 3D-печати. Скачайте STL-файл."
 
 def get_printables_model():
     url = "https://www.printables.com/model?period=day&sort=trending"
@@ -69,7 +103,7 @@ def get_printables_model():
             if og_image:
                 img_url = og_image["content"]
         
-        description = generate_visual_description(title)
+        description = generate_description_with_gemini(img_url, title) if img_url else f"📦 *{title}*\n\nМодель для 3D-печати."
         return {"title": title, "url": model_url, "description": description, "image": img_url}
     except Exception as e:
         print(f"Printables error: {e}")
@@ -120,7 +154,7 @@ def get_thingiverse_model():
                     img_url = src.replace("/card/", "/large/").replace("/thumb/", "/large/")
                     break
         
-        description = generate_visual_description(title)
+        description = generate_description_with_gemini(img_url, title) if img_url else f"📦 *{title}*\n\nМодель для 3D-печати."
         return {"title": title, "url": model_url, "description": description, "image": img_url}
     except Exception as e:
         print(f"Thingiverse error: {e}")
