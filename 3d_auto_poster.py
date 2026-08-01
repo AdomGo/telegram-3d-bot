@@ -10,7 +10,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 
 TOKEN = "8517153978:AAGNMGbzhu-saXIRqvbXMG0Vn56AbbcHxOY"
 CHAT_ID = "@TREEDSTL"
-GEMINI_API_KEY = "AQ.Ab8RN6Jf_AL-Umq704uEktnHJff5v8wshOu1kTHhI8AMT4AGrg"
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
