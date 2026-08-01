@@ -19,37 +19,14 @@ class HealthHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         return
 
-def generate_visual_description(img_url, title, raw_desc, model_url):
-    if "organizer" in title.lower() or "drawer" in title.lower():
-        header = f"⚡ {title}: Стильный органайзер в духе Mid-Century Modern!"
-    elif "vase" in title.lower():
-        header = f"🌸 {title}: Элегантная ваза для современного интерьера"
-    elif "holder" in title.lower() or "stand" in title.lower():
-        header = f"🧩 {title}: Удобный держатель для вашего стола"
-    elif "lamp" in title.lower():
-        header = f"💡 {title}: Светильник с характером"
-    else:
-        header = f"✨ {title}: Уникальная 3D-модель для вашего дома"
-
-    if raw_desc and len(raw_desc) > 50:
-        body = f"{raw_desc}\n\n"
-    else:
-        body = "Если ваш рабочий стол завален мелочевкой, эта модульная система — спасение. Сочетает в себе эстетику ретро-футуризма и строгую функциональность.\n\n"
-
-    highlights = (
-        "✅ **Модульность:** Собирайте конфигурацию под свои нужды, наращивая ярусы.\n"
-        "✅ **Эстетика:** Чистые линии превратят обычный пластик в элемент декора.\n"
-        "✅ **Практичность:** Идеально подходит для организации пространства в прихожей или на столе.\n"
-    )
-
-    tips = (
-        "💡 **Советы по печати:**\n"
-        "• 🧵 **Материал:** Используйте матовый PLA или текстурированный PETG.\n"
-        "• 🔥 **Точность:** Тщательно откалибруйте поток (flow), чтобы модули легко стыковались.\n"
-    )
-
-    description = f"{header}\n\n{body}{highlights}\n\n{tips}\n🔗 [Источник]({model_url})\n\n#3D #3Dпечать #STL #модель #3Dprinting #DIY"
-    return description
+def generate_visual_description(title):
+    # Генерируем описание на основе названия (без картинки)
+    templates = [
+        f"📦 *{title}*\n\nОтличная модель для 3D-печати. {title} — это стильный и функциональный предмет. Рекомендуется печатать с заполнением 20% и слоем 0.2 мм.\n\n✅ **Практичность:** Идеально подходит для дома или офиса.\n✅ **Эстетика:** Чистый дизайн.\n\n💡 **Совет:** Используйте матовый PLA.\n",
+        f"📦 *{title}*\n\nПотрясающий дизайн! {title} легко печатается и выглядит профессионально. Добавьте эту модель в свою коллекцию.\n\n✅ **Универсальность:** Подходит для любого интерьера.\n✅ **Простота:** Печатается без поддержек.\n\n💡 **Совет:** Слой 0.2 мм, заполнение 15%.\n",
+        f"📦 *{title}*\n\nПрактичная и красивая модель. {title} станет отличным дополнением вашего интерьера. Печатается без поддержек.\n\n✅ **Надёжность:** Прочная конструкция.\n✅ **Дизайн:** Современный минимализм.\n\n💡 **Совет:** Рекомендуется PETG для прочности.\n"
+    ]
+    return random.choice(templates)
 
 def get_printables_model():
     url = "https://www.printables.com/model?period=day&sort=trending"
@@ -71,14 +48,9 @@ def get_printables_model():
         if not model_url:
             return None
         
-        # Ждём загрузки описания
-        time.sleep(5)
-        
         detail_res = requests.get(model_url, headers=headers)
         detail_soup = BeautifulSoup(detail_res.text, "html.parser")
         title = detail_soup.find("h1").get_text(strip=True) if detail_soup.find("h1") else "3D Model"
-        desc_div = detail_soup.find("div", class_="description") or detail_soup.find("article")
-        raw_description = desc_div.get_text(strip=True) if desc_div else "No description available."
         
         img_url = None
         img_tags = detail_soup.find_all("img")
@@ -97,7 +69,7 @@ def get_printables_model():
             if og_image:
                 img_url = og_image["content"]
         
-        description = generate_visual_description(img_url, title, raw_description, model_url) if img_url else raw_description[:300]
+        description = generate_visual_description(title)
         return {"title": title, "url": model_url, "description": description, "image": img_url}
     except Exception as e:
         print(f"Printables error: {e}")
@@ -130,14 +102,9 @@ def get_thingiverse_model():
         if not model_url:
             return None
         
-        # Ждём загрузки описания
-        time.sleep(5)
-        
         detail_res = requests.get(model_url, headers=headers)
         detail_soup = BeautifulSoup(detail_res.text, "html.parser")
         title = detail_soup.find("h1").get_text(strip=True) if detail_soup.find("h1") else "3D Model"
-        desc_div = detail_soup.find("div", class_="thing-description") or detail_soup.find("div", class_="description") or detail_soup.find("div", id="description")
-        raw_description = desc_div.get_text(strip=True) if desc_div else "No description available."
         
         img_url = None
         og_image = detail_soup.find("meta", property="og:image")
@@ -153,7 +120,7 @@ def get_thingiverse_model():
                     img_url = src.replace("/card/", "/large/").replace("/thumb/", "/large/")
                     break
         
-        description = generate_visual_description(img_url, title, raw_description, model_url) if img_url else raw_description[:300]
+        description = generate_visual_description(title)
         return {"title": title, "url": model_url, "description": description, "image": img_url}
     except Exception as e:
         print(f"Thingiverse error: {e}")
@@ -285,6 +252,7 @@ def run_webserver():
 if __name__ == "__main__":
     threading.Thread(target=run_webserver, daemon=True).start()
     
+    # РАСПИСАНИЕ: с 9:00 до 21:00 каждый час
     schedule.every().day.at("09:00").do(job)
     schedule.every().day.at("10:00").do(job)
     schedule.every().day.at("11:00").do(job)
@@ -295,8 +263,11 @@ if __name__ == "__main__":
     schedule.every().day.at("16:00").do(job)
     schedule.every().day.at("17:00").do(job)
     schedule.every().day.at("18:00").do(job)
+    schedule.every().day.at("19:00").do(job)
+    schedule.every().day.at("20:00").do(job)
+    schedule.every().day.at("21:00").do(job)
     
-    print("🚀 Бот запущен. Жду расписания (9:00–18:00)")
+    print("🚀 Бот запущен. Жду расписания (9:00–21:00, 13 постов в день)")
     while True:
         schedule.run_pending()
         time.sleep(1)
