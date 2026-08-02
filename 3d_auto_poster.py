@@ -62,6 +62,57 @@ def generate_description_with_gemini(img_url, title):
         print(f"Gemini error: {e}")
         return f"📦 *{title}*\n\nМодель для 3D-печати. Скачайте STL-файл."
 
+def get_makerworld_model():
+    url = "https://makerworld.com/en/models/trending"
+    headers = {"User-Agent": "Mozilla/5.0"}
+    try:
+        response = requests.get(url, headers=headers)
+        soup = BeautifulSoup(response.text, "html.parser")
+        
+        # Ищем ссылки на модели
+        model_links = [a for a in soup.find_all("a", href=True) if "/models/" in a["href"] and not a["href"].endswith("/comments")]
+        if not model_links:
+            return None
+        
+        model_url = None
+        for a in model_links:
+            href = a["href"]
+            if href.startswith("/"): 
+                href = "https://makerworld.com" + href
+            if not is_already_posted(href):
+                model_url = href
+                break
+        
+        if not model_url:
+            return None
+        
+        detail_res = requests.get(model_url, headers=headers)
+        detail_soup = BeautifulSoup(detail_res.text, "html.parser")
+        
+        # Название
+        title_elem = detail_soup.find("h1")
+        title = title_elem.get_text(strip=True) if title_elem else "3D Model"
+        
+        # Картинка
+        img_url = None
+        og_image = detail_soup.find("meta", property="og:image")
+        if og_image:
+            img_url = og_image["content"]
+        else:
+            img_tags = detail_soup.find_all("img")
+            for img in img_tags:
+                src = img.get("src", "")
+                if "makerworld.com" in src:
+                    img_url = src
+                    break
+        
+        # Описание через Gemini
+        description = generate_description_with_gemini(img_url, title) if img_url else f"📦 *{title}*\n\nМодель для 3D-печати."
+        return {"title": title, "url": model_url, "description": description, "image": img_url}
+    except Exception as e:
+        print(f"MakerWorld error: {e}")
+        return None
+
 def get_printables_model():
     url = "https://www.printables.com/model?period=day&sort=trending"
     headers = {"User-Agent": "Mozilla/5.0"}
@@ -103,7 +154,6 @@ def get_printables_model():
             if og_image:
                 img_url = og_image["content"]
         
-        # Генерируем описание через Gemini
         description = generate_description_with_gemini(img_url, title) if img_url else f"📦 *{title}*\n\nМодель для 3D-печати."
         return {"title": title, "url": model_url, "description": description, "image": img_url}
     except Exception as e:
@@ -155,7 +205,6 @@ def get_thingiverse_model():
                     img_url = src.replace("/card/", "/large/").replace("/thumb/", "/large/")
                     break
         
-        # Генерируем описание через Gemini
         description = generate_description_with_gemini(img_url, title) if img_url else f"📦 *{title}*\n\nМодель для 3D-печати."
         return {"title": title, "url": model_url, "description": description, "image": img_url}
     except Exception as e:
@@ -239,6 +288,16 @@ def post_to_telegram(model):
     elif "thingiverse.com" in model["url"]:
         thing_id = model["url"].split(":")[-1]
         file_url = f"https://www.thingiverse.com/thing:{thing_id}/zip"
+    elif "makerworld.com" in model["url"]:
+        # Для MakerWorld попробуем найти ZIP или STL на странице
+        detail_res = requests.get(model["url"], headers={"User-Agent": "Mozilla/5.0"})
+        detail_soup = BeautifulSoup(detail_res.text, "html.parser")
+        download_links = [a for a in detail_soup.find_all("a", href=True) if ".stl" in a["href"] or "download" in a["href"].lower()]
+        if download_links:
+            file_url = download_links[0]["href"]
+            if not file_url.startswith("http"):
+                file_url = "https://makerworld.com" + file_url
+
     if file_url:
         file_path = download_file(file_url, f"{model['title'][:30]}.zip")
         if file_path and os.path.getsize(file_path) < 50 * 1024 * 1024:
@@ -259,26 +318,37 @@ def post_to_telegram(model):
 def job():
     print(f"⏰ {time.strftime('%H:%M')} - Запуск поиска модели...")
     
-    source = random.choice(["printables", "thingiverse"])
+    # Случайный выбор площадки (MakerWorld теперь тоже в списке)
+    source = random.choice(["printables", "thingiverse", "makerworld"])
     print(f"🔍 Выбрана площадка: {source}")
     
     model = None
     if source == "printables":
         model = get_printables_model()
-        if not model:
-            print("❌ Printables не дал результат, пробую Thingiverse...")
-            model = get_thingiverse_model()
-    else:
+    elif source == "thingiverse":
         model = get_thingiverse_model()
-        if not model:
-            print("❌ Thingiverse не дал результат, пробую Printables...")
-            model = get_printables_model()
+    else:
+        model = get_makerworld_model()
+    
+    # Если выбранная площадка не дала результат, пробуем другие
+    if not model:
+        print(f"❌ {source} не дал результат, пробую другие площадки...")
+        for try_source in ["printables", "thingiverse", "makerworld"]:
+            if try_source == source: continue
+            if try_source == "printables":
+                model = get_printables_model()
+            elif try_source == "thingiverse":
+                model = get_thingiverse_model()
+            else:
+                model = get_makerworld_model()
+            if model:
+                break
     
     if model:
-        print(f"✅ Найдена модель: {model['title']}")
+        print(f"✅ Найдена модель: {model['title']} с {source}")
         post_to_telegram(model)
     else:
-        print("❌ Модель не найдена на обеих площадках")
+        print("❌ Модель не найдена на всех площадках")
 
 def run_webserver():
     server = HTTPServer(('0.0.0.0', 10000), HealthHandler)
