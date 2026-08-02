@@ -103,6 +103,7 @@ def get_printables_model():
             if og_image:
                 img_url = og_image["content"]
         
+        # Генерируем описание через Gemini
         description = generate_description_with_gemini(img_url, title) if img_url else f"📦 *{title}*\n\nМодель для 3D-печати."
         return {"title": title, "url": model_url, "description": description, "image": img_url}
     except Exception as e:
@@ -154,6 +155,7 @@ def get_thingiverse_model():
                     img_url = src.replace("/card/", "/large/").replace("/thumb/", "/large/")
                     break
         
+        # Генерируем описание через Gemini
         description = generate_description_with_gemini(img_url, title) if img_url else f"📦 *{title}*\n\nМодель для 3D-печати."
         return {"title": title, "url": model_url, "description": description, "image": img_url}
     except Exception as e:
