@@ -15,7 +15,7 @@ def test_gemini():
         img_data = requests.get(img_url, timeout=10).content
         img_b64 = base64.b64encode(img_data).decode('utf-8')
         
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent?key={GEMINI_API_KEY}"
+        url = f"https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
         prompt = "Опиши эту картинку на русском языке, кратко, 100 символов."
         
         payload = {
