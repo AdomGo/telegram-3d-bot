@@ -1,376 +1,569 @@
+#!/usr/bin/env python3
+"""
+3D Auto Poster — Telegram-бот для автоматической публикации 3D-моделей.
+Парсит Printables.com, Thingiverse.com, MakerWorld.com,
+публикует посты в Telegram-канал по расписанию (9:00–21:00, каждый час).
+Готов к деплою на Render.com как Web Service.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import sys
+import json
+import time
+import random
+import sqlite3
+import logging
+import hashlib
+import asyncio
+import threading
+import traceback
+from datetime import datetime
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from io import BytesIO
+from typing import Optional, List, Dict, Any
+from urllib.parse import urljoin, urlparse
+
+# ── HTTP / Парсинг ───────────────────────────────────────────────────
 import requests
 from bs4 import BeautifulSoup
-import time
-import os
+
+# ── Планировщик ──────────────────────────────────────────────────────
 import schedule
-import threading
-import random
-import base64
-from http.server import HTTPServer, BaseHTTPRequestHandler
 
-TOKEN = "8517153978:AAGNMGbzhu-saXIRqvbXMG0Vn56AbbcHxOY"
-CHAT_ID = "@TREEDSTL"
+# ── Telegram ─────────────────────────────────────────────────────────
+from telegram import Bot
+from telegram.constants import ParseMode
+from telegram.error import TelegramError
 
+# ═══════════════════════════════════════════════════════════════════════
+# ЛОГИРОВАНИЕ
+# ═══════════════════════════════════════════════════════════════════════
+LOG_LEVEL: str = "INFO"
+LOG_FORMAT: str = "%(asctime)s [%(levelname)s] %(message)s"
+
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format=LOG_FORMAT,
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+    ],
+)
+logger = logging.getLogger("3D_AutoPoster")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# КОНФИГУРАЦИЯ
+# ═══════════════════════════════════════════════════════════════════════
+class Config:
+    """Централизованный доступ к настройкам бота."""
+
+    # --- Telegram ---
+    BOT_TOKEN: str        = "8517153978:AAGNMGbzhu-saXIRqvbXMG0Vn56AbbcHxOY"
+    CHANNEL_ID: str       = "@TREEDSTL"
+
+    # --- Расписание ---
+    POST_START_HOUR: int  = 9
+    POST_END_HOUR: int    = 21
+    POST_INTERVAL_MINUTES: int = 60
+
+    # --- HTTP ---
+    REQUEST_TIMEOUT: int  = 30
+    MAX_RETRIES: int      = 3
+
+    # --- Веб-сервер ---
+    PORT: int             = 10000
+
+    # --- Файлы ---
+    MAX_DOWNLOAD_SIZE: int = 47185920
+
+    @classmethod
+    def validate(cls) -> List[str]:
+        errors: List[str] = []
+        if not cls.BOT_TOKEN:
+            errors.append("TELEGRAM_BOT_TOKEN не задан")
+        if not cls.CHANNEL_ID:
+            errors.append("TELEGRAM_CHANNEL_ID не задан")
+        return errors
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# БАЗА ДАННЫХ (SQLite)
+# ═══════════════════════════════════════════════════════════════════════
+class Database:
+    DB_PATH: str = "posted_models.db"
+
+    def __init__(self) -> None:
+        self.conn = sqlite3.connect(self.DB_PATH, check_same_thread=False)
+        self.conn.row_factory = sqlite3.Row
+        self._init_tables()
+
+    def _init_tables(self) -> None:
+        self.conn.executescript("""
+            CREATE TABLE IF NOT EXISTS posted_models (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                model_id    TEXT    NOT NULL,
+                source      TEXT    NOT NULL,
+                url         TEXT    NOT NULL,
+                title       TEXT    DEFAULT '',
+                posted_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(model_id, source)
+            );
+            CREATE TABLE IF NOT EXISTS post_log (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                model_id    TEXT    NOT NULL,
+                source      TEXT    NOT NULL,
+                status      TEXT    NOT NULL,
+                message     TEXT    DEFAULT '',
+                created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+        self.conn.commit()
+
+    def is_posted(self, model_id: str, source: str) -> bool:
+        row = self.conn.execute(
+            "SELECT 1 FROM posted_models WHERE model_id = ? AND source = ?",
+            (model_id, source),
+        ).fetchone()
+        return row is not None
+
+    def mark_posted(self, model_id: str, source: str, url: str, title: str = "") -> None:
+        self.conn.execute(
+            "INSERT OR IGNORE INTO posted_models (model_id, source, url, title) VALUES (?, ?, ?, ?)",
+            (model_id, source, url, title),
+        )
+        self.conn.commit()
+
+    def count_posted(self) -> int:
+        row = self.conn.execute("SELECT COUNT(*) AS cnt FROM posted_models").fetchone()
+        return row["cnt"] if row else 0
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# HTTP-КЛИЕНТ
+# ═══════════════════════════════════════════════════════════════════════
+class HttpClient:
+    USER_AGENTS: List[str] = [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    ]
+
+    def __init__(self, timeout: int = 30, max_retries: int = 3) -> None:
+        self.timeout = timeout
+        self.max_retries = max_retries
+        self.session = requests.Session()
+
+    def _base_headers(self) -> Dict[str, str]:
+        return {
+            "User-Agent": random.choice(self.USER_AGENTS),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9,ru;q=0.8",
+        }
+
+    def get(self, url: str, **kwargs) -> requests.Response:
+        last_exc: Optional[Exception] = None
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                kwargs.setdefault("headers", self._base_headers())
+                kwargs.setdefault("timeout", self.timeout)
+                resp = self.session.get(url, **kwargs)
+                resp.raise_for_status()
+                return resp
+            except Exception as e:
+                last_exc = e
+                logger.warning("Ошибка %d/%d для %s", attempt, self.max_retries, url)
+                if attempt < self.max_retries:
+                    time.sleep(2 ** attempt)
+        raise last_exc  # type: ignore[misc]
+
+    def download(self, url: str, max_size: int = 0) -> Optional[bytes]:
+        try:
+            resp = self.get(url, stream=True)
+            content = bytearray()
+            for chunk in resp.iter_content(chunk_size=16384):
+                if chunk:
+                    content.extend(chunk)
+                    if max_size and len(content) > max_size:
+                        return None
+            return bytes(content)
+        except Exception:
+            return None
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# ГЕНЕРАТОР ОПИСАНИЙ (шаблонный, без ИИ)
+# ═══════════════════════════════════════════════════════════════════════
+class DescriptionGenerator:
+    def _template_based(self, title: str) -> Dict[str, Any]:
+        clean_title = re.sub(r"[-_]+", " ", title).strip()
+        clean_title = re.sub(r"\.(stl|obj|3mf|step|stp)$", "", clean_title, flags=re.IGNORECASE)
+        if len(clean_title) > 60:
+            clean_title = clean_title[:57] + "..."
+
+        templates: List[Dict[str, Any]] = [
+            {
+                "description": f"🔧 Отличная модель «{clean_title}» для 3D-печати! Подойдёт как для домашнего использования, так и для профессиональных проектов.",
+                "print_tips": ["Рекомендуемая высота слоя: 0.2 мм", "Заполнение: 15-20%"],
+            },
+            {
+                "description": f"✨ Представляем «{clean_title}» — стильную и функциональную 3D-модель. Лёгкая в печати.",
+                "print_tips": ["Печатайте с brim (8-10 мм)", "PLA или PETG — оптимальные материалы"],
+            },
+        ]
+        tpl = random.choice(templates)
+        return {
+            "title": clean_title,
+            "description": tpl["description"],
+            "print_tips": tpl["print_tips"],
+            "hashtags": ["#3Dпечать", "#3Dмодель", "#3DPrinting", "#DIY"],
+        }
+
+    def generate(self, image_url: str, fallback_title: str = "3D-модель") -> Dict[str, Any]:
+        return self._template_based(fallback_title)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# ПАРСЕРЫ САЙТОВ
+# ═══════════════════════════════════════════════════════════════════════
+class BaseScraper:
+    SOURCE: str = "unknown"
+    BASE_URL: str = ""
+    MODELS_URL: str = ""
+
+    def __init__(self, http: HttpClient) -> None:
+        self.http = http
+
+    def fetch_models(self, limit: int = 12) -> List[Dict[str, Any]]:
+        raise NotImplementedError
+
+    @staticmethod
+    def _make_id(url: str, prefix: str = "") -> str:
+        if prefix:
+            return f"{prefix}_{hashlib.sha256(url.encode()).hexdigest()[:12]}"
+        return hashlib.sha256(url.encode()).hexdigest()[:12]
+
+    @staticmethod
+    def _normalize_image_url(raw: Optional[str], base_url: str) -> str:
+        if not raw:
+            return ""
+        raw = raw.strip()
+        if raw.startswith("http"):
+            return raw
+        if raw.startswith("//"):
+            return "https:" + raw
+        if raw.startswith("/"):
+            return urljoin(base_url, raw)
+        return urljoin(base_url, raw)
+
+
+class PrintablesScraper(BaseScraper):
+    SOURCE = "printables"
+    BASE_URL = "https://www.printables.com"
+    MODELS_URL = "https://www.printables.com/model?o=newest"
+
+    def fetch_models(self, limit: int = 12) -> List[Dict[str, Any]]:
+        models: List[Dict[str, Any]] = []
+        try:
+            resp = self.http.get(self.MODELS_URL)
+            soup = BeautifulSoup(resp.text, "lxml")
+            cards = soup.select("a[href*='/model/']")
+            for card in cards:
+                if len(models) >= limit:
+                    break
+                href = card.get("href", "")
+                if not href:
+                    continue
+                url = urljoin(self.BASE_URL, href.split("?")[0])
+                model_id = self._make_id(url, "pr")
+                title = card.get_text(strip=True)[:60] or "3D-модель"
+                img_el = card.select_one("img")
+                image_url = self._normalize_image_url(
+                    (img_el.get("src") or img_el.get("data-src")) if img_el else None,
+                    self.BASE_URL,
+                )
+                models.append({
+                    "model_id": model_id,
+                    "source": self.SOURCE,
+                    "title": title,
+                    "url": url,
+                    "image_url": image_url,
+                    "download_url": f"{url}/download",
+                })
+        except Exception as e:
+            logger.error("❌ Ошибка Printables: %s", e)
+        return models
+
+
+class ThingiverseScraper(BaseScraper):
+    SOURCE = "thingiverse"
+    BASE_URL = "https://www.thingiverse.com"
+    MODELS_URL = "https://www.thingiverse.com/things/recent"
+
+    def fetch_models(self, limit: int = 12) -> List[Dict[str, Any]]:
+        models: List[Dict[str, Any]] = []
+        try:
+            resp = self.http.get(self.MODELS_URL)
+            soup = BeautifulSoup(resp.text, "lxml")
+            cards = soup.select("a[href*='/thing:']")
+            for card in cards:
+                if len(models) >= limit:
+                    break
+                href = card.get("href", "")
+                if not href:
+                    continue
+                url = urljoin(self.BASE_URL, href.split("?")[0])
+                model_id = self._make_id(url, "tv")
+                title = card.get_text(strip=True)[:60] or "3D-модель"
+                img_el = card.select_one("img")
+                image_url = self._normalize_image_url(
+                    (img_el.get("src") or img_el.get("data-src")) if img_el else None,
+                    self.BASE_URL,
+                )
+                models.append({
+                    "model_id": model_id,
+                    "source": self.SOURCE,
+                    "title": title,
+                    "url": url,
+                    "image_url": image_url,
+                    "download_url": f"https://www.thingiverse.com/thing:{model_id}/zip",
+                })
+        except Exception as e:
+            logger.error("❌ Ошибка Thingiverse: %s", e)
+        return models
+
+
+class MakerWorldScraper(BaseScraper):
+    SOURCE = "makerworld"
+    BASE_URL = "https://makerworld.com"
+    MODELS_URL = "https://makerworld.com/en/models?sort=newest"
+
+    def fetch_models(self, limit: int = 12) -> List[Dict[str, Any]]:
+        models: List[Dict[str, Any]] = []
+        try:
+            resp = self.http.get(self.MODELS_URL)
+            soup = BeautifulSoup(resp.text, "lxml")
+            cards = soup.select("a[href*='/models/']")
+            for card in cards:
+                if len(models) >= limit:
+                    break
+                href = card.get("href", "")
+                if not href:
+                    continue
+                url = urljoin(self.BASE_URL, href.split("?")[0])
+                model_id = self._make_id(url, "mw")
+                title = card.get_text(strip=True)[:60] or "3D-модель"
+                img_el = card.select_one("img")
+                image_url = self._normalize_image_url(
+                    (img_el.get("src") or img_el.get("data-src")) if img_el else None,
+                    self.BASE_URL,
+                )
+                models.append({
+                    "model_id": model_id,
+                    "source": self.SOURCE,
+                    "title": title,
+                    "url": url,
+                    "image_url": image_url,
+                    "download_url": f"{url}/download",
+                })
+        except Exception as e:
+            logger.error("❌ Ошибка MakerWorld: %s", e)
+        return models
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# ПУБЛИКАЦИЯ В TELEGRAM
+# ═══════════════════════════════════════════════════════════════════════
+class TelegramPublisher:
+    def __init__(self) -> None:
+        self.bot = Bot(token=Config.BOT_TOKEN)
+
+    async def publish(self, model: Dict[str, Any], description: Dict[str, Any]) -> bool:
+        try:
+            title = description.get("title", model.get("title", "3D-модель"))
+            desc = description.get("description", "")
+            tips: List[str] = description.get("print_tips", [])
+            hashtags: List[str] = description.get("hashtags", ["#3Dпечать", "#3Dмодель"])
+            url = model.get("url", "")
+            source = model.get("source", "")
+
+            lines: List[str] = [
+                f"<b>🚀 {title}</b>",
+                "",
+                desc,
+                "",
+            ]
+            if tips:
+                lines.append("<b>💡 Советы по печати:</b>")
+                for tip in tips:
+                    lines.append(f"  • {tip}")
+                lines.append("")
+            lines.append(f'🔗 <a href="{url}">Скачать на {source.capitalize()}</a>')
+            lines.append("")
+            lines.append(" ".join(hashtags))
+
+            caption = "\n".join(lines)
+
+            # 1. Фото
+            photo_url = model.get("image_url", "")
+            if photo_url:
+                await self.bot.send_photo(
+                    chat_id=Config.CHANNEL_ID,
+                    photo=photo_url,
+                    caption=caption,
+                    parse_mode=ParseMode.HTML,
+                )
+            else:
+                await self.bot.send_message(
+                    chat_id=Config.CHANNEL_ID,
+                    text=caption,
+                    parse_mode=ParseMode.HTML,
+                )
+
+            # 2. Файл
+            download_url = model.get("download_url", "")
+            if download_url:
+                content = self._download_file(download_url)
+                if content:
+                    filename = f"{title[:30]}.zip"
+                    await self.bot.send_document(
+                        chat_id=Config.CHANNEL_ID,
+                        document=BytesIO(content),
+                        filename=filename,
+                    )
+            return True
+        except Exception as e:
+            logger.error("❌ Ошибка публикации: %s", e)
+            return False
+
+    def _download_file(self, url: str) -> Optional[bytes]:
+        try:
+            r = requests.get(url, timeout=30, stream=True)
+            content = bytearray()
+            for chunk in r.iter_content(chunk_size=16384):
+                if chunk:
+                    content.extend(chunk)
+                    if len(content) > Config.MAX_DOWNLOAD_SIZE:
+                        return None
+            return bytes(content)
+        except:
+            return None
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# ОСНОВНОЙ ОРКЕСТРАТОР
+# ═══════════════════════════════════════════════════════════════════════
+class AutoPoster:
+    def __init__(self) -> None:
+        self.http = HttpClient(timeout=Config.REQUEST_TIMEOUT, max_retries=Config.MAX_RETRIES)
+        self.db = Database()
+        self.desc_gen = DescriptionGenerator()
+        self.publisher = TelegramPublisher()
+        self.scrapers: List[BaseScraper] = [
+            PrintablesScraper(self.http),
+            ThingiverseScraper(self.http),
+            MakerWorldScraper(self.http),
+        ]
+
+    def find_and_post(self) -> bool:
+        random.shuffle(self.scrapers)
+        for scraper in self.scrapers:
+            logger.info("🔍 Поиск на %s ...", scraper.SOURCE)
+            try:
+                models = scraper.fetch_models(limit=15)
+            except Exception as e:
+                logger.error("   ❌ Ошибка: %s", e)
+                continue
+            if not models:
+                continue
+            random.shuffle(models)
+            for model in models:
+                model_id: str = model["model_id"]
+                source: str = model["source"]
+                title: str = model.get("title", "Без названия")
+                if self.db.is_posted(model_id, source):
+                    continue
+                logger.info("   🎯 Новая: «%s» (%s)", title, source)
+                description = self.desc_gen.generate(
+                    image_url=model.get("image_url", ""),
+                    fallback_title=title,
+                )
+                try:
+                    success = asyncio.run(self.publisher.publish(model, description))
+                except:
+                    success = False
+                if success:
+                    self.db.mark_posted(model_id, source, model.get("url", ""), title)
+                    return True
+        return False
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# ФЕЙКОВЫЙ HTTP-СЕРВЕР
+# ═══════════════════════════════════════════════════════════════════════
 class HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
+    def do_GET(self) -> None:
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bot is running")
-    
-    def log_message(self, format, *args):
-        return
+        self.wfile.write(b"Bot is running\n")
 
-def generate_description_with_deepseek(img_url, title):
-    """Генерирует описание по картинке через DeepSeek Vision (бесплатно)"""
+
+def run_webserver(port: int) -> None:
     try:
-        # Сначала скачиваем картинку в base64
-        img_data = requests.get(img_url, timeout=15).content
-        img_b64 = base64.b64encode(img_data).decode('utf-8')
-        
-        url = "https://api.deepseek.com/chat/completions"
-        headers = {"Content-Type": "application/json"}
-        
-        prompt = f"""Ты — эксперт по 3D-печати. Посмотри на эту картинку.
-Напиши красивое описание для Telegram-канала на русском языке для этой модели.
-Название модели: {title}
-
-Опиши:
-1. Что это за модель (кратко)
-2. Для чего она нужна
-3. Пару советов по печати (материал, слой, поддержки)
-
-Используй эмодзи, не пиши лишнего. Максимум 500 символов."""
-        
-        payload = {
-            "model": "deepseek-vision",
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}}
-                    ]
-                }
-            ],
-            "max_tokens": 500
-        }
-        
-        response = requests.post(url, headers=headers, json=payload, timeout=20)
-        data = response.json()
-        
-        if 'choices' in data and len(data['choices']) > 0:
-            text = data['choices'][0]['message']['content']
-            return text.strip()
-        else:
-            return f"📦 *{title}*\n\nОтличная 3D-модель. Рекомендуется для печати."
+        server = HTTPServer(("0.0.0.0", port), HealthHandler)
+        logger.info("🌐 Веб-сервер запущен на порту %d", port)
+        server.serve_forever()
     except Exception as e:
-        print(f"DeepSeek error: {e}")
-        return f"📦 *{title}*\n\nМодель для 3D-печати. Скачайте STL-файл."
+        logger.error("Ошибка веб-сервера: %s", e)
 
-def get_makerworld_model():
-    url = "https://makerworld.com/en/models/trending"
-    headers = {"User-Agent": "Mozilla/5.0"}
-    try:
-        response = requests.get(url, headers=headers)
-        soup = BeautifulSoup(response.text, "html.parser")
-        
-        model_links = [a for a in soup.find_all("a", href=True) if "/models/" in a["href"] and not a["href"].endswith("/comments")]
-        if not model_links:
-            return None
-        
-        model_url = None
-        for a in model_links:
-            href = a["href"]
-            if href.startswith("/"): 
-                href = "https://makerworld.com" + href
-            if not is_already_posted(href):
-                model_url = href
-                break
-        
-        if not model_url:
-            return None
-        
-        detail_res = requests.get(model_url, headers=headers)
-        detail_soup = BeautifulSoup(detail_res.text, "html.parser")
-        
-        title_elem = detail_soup.find("h1")
-        title = title_elem.get_text(strip=True) if title_elem else "3D Model"
-        
-        img_url = None
-        og_image = detail_soup.find("meta", property="og:image")
-        if og_image:
-            img_url = og_image["content"]
-        else:
-            img_tags = detail_soup.find_all("img")
-            for img in img_tags:
-                src = img.get("src", "")
-                if "makerworld.com" in src:
-                    img_url = src
-                    break
-        
-        description = generate_description_with_deepseek(img_url, title) if img_url else f"📦 *{title}*\n\nМодель для 3D-печати."
-        return {"title": title, "url": model_url, "description": description, "image": img_url}
-    except Exception as e:
-        print(f"MakerWorld error: {e}")
-        return None
 
-def get_printables_model():
-    url = "https://www.printables.com/model?period=day&sort=trending"
-    headers = {"User-Agent": "Mozilla/5.0"}
-    try:
-        response = requests.get(url, headers=headers)
-        soup = BeautifulSoup(response.text, "html.parser")
-        model_links = [a for a in soup.find_all("a", href=True) if a["href"].startswith("/model/") and not a["href"].endswith("/comments")]
-        if not model_links:
-            return None
-        
-        model_url = None
-        for a in model_links:
-            test_url = "https://www.printables.com" + a["href"]
-            if not is_already_posted(test_url):
-                model_url = test_url
-                break
-        
-        if not model_url:
-            return None
-        
-        detail_res = requests.get(model_url, headers=headers)
-        detail_soup = BeautifulSoup(detail_res.text, "html.parser")
-        title = detail_soup.find("h1").get_text(strip=True) if detail_soup.find("h1") else "3D Model"
-        
-        img_url = None
-        img_tags = detail_soup.find_all("img")
-        for img in img_tags:
-            src = img.get("src", "")
-            if "media.printables.com" in src:
-                if "/thumbs/" in src:
-                    src = src.replace("/thumbs/render/", "/media/").replace("/thumbs/model/", "/media/")
-                    import re
-                    src = re.sub(r"_thumb_.*?\.", ".", src)
-                img_url = src
-                break
-        
-        if not img_url:
-            og_image = detail_soup.find("meta", property="og:image")
-            if og_image:
-                img_url = og_image["content"]
-        
-        description = generate_description_with_deepseek(img_url, title) if img_url else f"📦 *{title}*\n\nМодель для 3D-печати."
-        return {"title": title, "url": model_url, "description": description, "image": img_url}
-    except Exception as e:
-        print(f"Printables error: {e}")
-        return None
-
-def get_thingiverse_model():
-    url = "https://www.thingiverse.com/explore/popular?page=1"
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"}
-    try:
-        response = requests.get(url, headers=headers)
-        soup = BeautifulSoup(response.text, "html.parser")
-        model_links = [a for a in soup.find_all("a", href=True) if "/thing:" in a["href"]]
-        if not model_links:
-            return None
-        
-        unique_urls = []
-        for a in model_links:
-            href = a["href"]
-            if not href.startswith("http"):
-                href = "https://www.thingiverse.com" + href
-            if href not in unique_urls:
-                unique_urls.append(href)
-        
-        model_url = None
-        for test_url in unique_urls:
-            if not is_already_posted(test_url):
-                model_url = test_url
-                break
-        
-        if not model_url:
-            return None
-        
-        detail_res = requests.get(model_url, headers=headers)
-        detail_soup = BeautifulSoup(detail_res.text, "html.parser")
-        title = detail_soup.find("h1").get_text(strip=True) if detail_soup.find("h1") else "3D Model"
-        
-        img_url = None
-        og_image = detail_soup.find("meta", property="og:image")
-        if og_image:
-            img_url = og_image["content"]
-            if "/renders/" in img_url:
-                img_url = img_url.replace("/card/", "/large/").replace("/thumb/", "/large/")
-        else:
-            img_tags = detail_soup.find_all("img")
-            for img in img_tags:
-                src = img.get("src", "")
-                if "cdn.thingiverse.com" in src:
-                    img_url = src.replace("/card/", "/large/").replace("/thumb/", "/large/")
-                    break
-        
-        description = generate_description_with_deepseek(img_url, title) if img_url else f"📦 *{title}*\n\nМодель для 3D-печати."
-        return {"title": title, "url": model_url, "description": description, "image": img_url}
-    except Exception as e:
-        print(f"Thingiverse error: {e}")
-        return None
-
-def is_already_posted(url):
-    history_file = "posted_models.txt"
-    if not os.path.exists(history_file):
-        return False
-    with open(history_file, "r") as f:
-        posted = f.read().splitlines()
-    return url in posted
-
-def mark_as_posted(url):
-    history_file = "posted_models.txt"
-    with open(history_file, "a") as f:
-        f.write(url + "\n")
-
-def download_file(url, filename):
-    headers = {"User-Agent": "Mozilla/5.0"}
-    filename = "".join([c for c in filename if c.isalnum() or c in (".", "_", "-")]).strip()
-    try:
-        if not os.path.exists("Downloads"):
-            os.makedirs("Downloads")
-        r = requests.get(url, headers=headers, stream=True)
-        path = os.path.join("Downloads", filename)
-        with open(path, "wb") as f:
-            for chunk in r.iter_content(chunk_size=8192):
-                f.write(chunk)
-        return path
-    except Exception as e:
-        print(f"Download error: {e}")
-        return None
-
-def post_to_telegram(model):
-    if not model:
-        print("No model found to post.")
-        return
-    if is_already_posted(model["url"]):
-        print(f"Model {model['url']} already posted. Skipping.")
-        return None
-
-    caption = model["description"]
-    
-    # 1. Сначала скачиваем фото локально
-    img_path = None
-    if model["image"]:
-        img_filename = f"img_{int(time.time())}.jpg"
-        img_path = download_file(model["image"], img_filename)
-
-    # 2. Отправляем фото (как файл, а не как ссылку)
-    if img_path:
-        with open(img_path, "rb") as f:
-            url = f"https://api.telegram.org/bot{TOKEN}/sendPhoto"
-            files = {"photo": f}
-            data = {"chat_id": CHAT_ID, "caption": caption, "parse_mode": "Markdown"}
-            res = requests.post(url, data=data, files=files).json()
-            if res.get("ok"):
-                print("✅ Фото отправлено")
-            else:
-                print(f"❌ Ошибка фото: {res.text}")
-                return
-        # Удаляем временный файл
-        if os.path.exists(img_path):
-            os.remove(img_path)
+# ═══════════════════════════════════════════════════════════════════════
+# ПЛАНИРОВЩИК
+# ═══════════════════════════════════════════════════════════════════════
+def job(poster: AutoPoster) -> None:
+    now = datetime.now()
+    if Config.POST_START_HOUR <= now.hour <= Config.POST_END_HOUR:
+        logger.info("⏰ Запуск публикации...")
+        poster.find_and_post()
     else:
-        # Если фото нет — отправляем только текст
-        url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-        data = {"chat_id": CHAT_ID, "text": caption, "parse_mode": "Markdown"}
-        res = requests.post(url, data=data).json()
-        if not res.get("ok"):
-            print(f"❌ Ошибка текста: {res.text}")
-            return
+        logger.info("⏸ Пропуск: вне диапазона")
 
-    # 3. Скачиваем и отправляем STL/ZIP
-    file_url = None
-    if "printables.com" in model["url"]:
-        model_id = model["url"].split("/")[-1].split("-")[0]
-        file_url = f"https://www.printables.com/model/{model_id}/download"
-    elif "thingiverse.com" in model["url"]:
-        thing_id = model["url"].split(":")[-1]
-        file_url = f"https://www.thingiverse.com/thing:{thing_id}/zip"
-    elif "makerworld.com" in model["url"]:
-        detail_res = requests.get(model["url"], headers={"User-Agent": "Mozilla/5.0"})
-        detail_soup = BeautifulSoup(detail_res.text, "html.parser")
-        download_links = [a for a in detail_soup.find_all("a", href=True) if ".stl" in a["href"] or "download" in a["href"].lower()]
-        if download_links:
-            file_url = download_links[0]["href"]
-            if not file_url.startswith("http"):
-                file_url = "https://makerworld.com" + file_url
 
-    if file_url:
-        file_path = download_file(file_url, f"{model['title'][:30]}.zip")
-        if file_path and os.path.getsize(file_path) < 50 * 1024 * 1024:
-            with open(file_path, "rb") as f:
-                url = f"https://api.telegram.org/bot{TOKEN}/sendDocument"
-                files = {"document": f}
-                data = {"chat_id": CHAT_ID}
-                doc_res = requests.post(url, data=data, files=files).json()
-                if doc_res.get("ok"):
-                    print("✅ ZIP отправлен")
-                else:
-                    print(f"❌ Ошибка ZIP: {doc_res.text}")
-            os.remove(file_path)
-    
-    mark_as_posted(model["url"])
-    print("✅ Пост полностью завершён!")
-
-def job():
-    print(f"⏰ {time.strftime('%H:%M')} - Запуск поиска модели...")
-    
-    source = random.choice(["printables", "thingiverse", "makerworld"])
-    print(f"🔍 Выбрана площадка: {source}")
-    
-    model = None
-    if source == "printables":
-        model = get_printables_model()
-    elif source == "thingiverse":
-        model = get_thingiverse_model()
-    else:
-        model = get_makerworld_model()
-    
-    if not model:
-        print(f"❌ {source} не дал результат, пробую другие площадки...")
-        for try_source in ["printables", "thingiverse", "makerworld"]:
-            if try_source == source: continue
-            if try_source == "printables":
-                model = get_printables_model()
-            elif try_source == "thingiverse":
-                model = get_thingiverse_model()
-            else:
-                model = get_makerworld_model()
-            if model:
-                break
-    
-    if model:
-        print(f"✅ Найдена модель: {model['title']} с {source}")
-        post_to_telegram(model)
-    else:
-        print("❌ Модель не найдена на всех площадках")
-
-def run_webserver():
-    server = HTTPServer(('0.0.0.0', 10000), HealthHandler)
-    print("🌐 Веб-сервер запущен на порту 10000 (для Render)")
-    server.serve_forever()
-
-if __name__ == "__main__":
-    threading.Thread(target=run_webserver, daemon=True).start()
-    
-    schedule.every().day.at("09:00").do(job)
-    schedule.every().day.at("10:00").do(job)
-    schedule.every().day.at("11:00").do(job)
-    schedule.every().day.at("12:00").do(job)
-    schedule.every().day.at("13:00").do(job)
-    schedule.every().day.at("14:00").do(job)
-    schedule.every().day.at("15:00").do(job)
-    schedule.every().day.at("16:00").do(job)
-    schedule.every().day.at("17:00").do(job)
-    schedule.every().day.at("18:00").do(job)
-    schedule.every().day.at("19:00").do(job)
-    schedule.every().day.at("20:00").do(job)
-    schedule.every().day.at("21:00").do(job)
-    
-    print("🚀 Бот запущен. Жду расписания (9:00–21:00, 13 постов в день)")
+def run_scheduler(poster: AutoPoster) -> None:
+    schedule.every().hour.at(":00").do(job, poster)
+    logger.info("📅 Планировщик запущен (9:00–21:00)")
     while True:
         schedule.run_pending()
-        time.sleep(1)
+        time.sleep(30)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# ТОЧКА ВХОДА
+# ═══════════════════════════════════════════════════════════════════════
+def main() -> None:
+    print("═" * 60)
+    print("🚀 3D Auto Poster (с твоими данными)")
+    print("═" * 60)
+
+    if not Config.BOT_TOKEN or not Config.CHANNEL_ID:
+        print("❌ Ошибка: проверь токен и CHANNEL_ID в Config")
+        sys.exit(1)
+
+    poster = AutoPoster()
+    logger.info("📊 Ранее опубликовано: %d моделей", poster.db.count_posted())
+
+    # Веб-сервер
+    threading.Thread(target=run_webserver, args=(Config.PORT,), daemon=True).start()
+
+    # Планировщик
+    try:
+        run_scheduler(poster)
+    except KeyboardInterrupt:
+        logger.info("🛑 Остановлено")
+
+
+if __name__ == "__main__":
+    main()
