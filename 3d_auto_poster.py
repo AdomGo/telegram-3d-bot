@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 3D Auto Poster — Telegram-бот для автоматической публикации 3D-моделей.
-Парсит Printables, Thingiverse, MakerWorld.
+Парсит Printables, Thingiverse, MakerWorld, Creality Cloud.
 """
 
 from __future__ import annotations
@@ -269,7 +269,6 @@ class PrintablesScraper(BaseScraper):
 class ThingiverseScraper(BaseScraper):
     SOURCE = "thingiverse"
     BASE_URL = "https://www.thingiverse.com"
-    # Thingiverse недавно изменил URL, используем /explore/popular
     MODELS_URL = "https://www.thingiverse.com/explore/popular?page=1"
 
     def fetch_models(self, limit: int = 12) -> List[Dict[str, Any]]:
@@ -313,7 +312,6 @@ class MakerWorldScraper(BaseScraper):
     def fetch_models(self, limit: int = 12) -> List[Dict[str, Any]]:
         models = []
         try:
-            # MakerWorld блокирует ботов — добавляем больше заголовков
             headers = self.http._base_headers()
             headers.update({
                 "Referer": "https://makerworld.com/",
@@ -349,6 +347,55 @@ class MakerWorldScraper(BaseScraper):
                 })
         except Exception as e:
             logger.error("❌ MakerWorld: %s", e)
+        return models
+
+
+# ===== НОВЫЙ ПАРСЕР: CREALITY CLOUD =====
+class CrealityCloudScraper(BaseScraper):
+    SOURCE = "crealitycloud"
+    BASE_URL = "https://www.crealitycloud.com"
+    # Список моделей (страница всех моделей, сортировка по новизне)
+    MODELS_URL = "https://www.crealitycloud.com/models?sort=latest"
+
+    def fetch_models(self, limit: int = 12) -> List[Dict[str, Any]]:
+        models = []
+        try:
+            resp = self.http.get(self.MODELS_URL)
+            soup = BeautifulSoup(resp.text, "html.parser")
+            # Пробуем найти карточки моделей. Селектор может отличаться, но обычно это ссылки на /model/...
+            cards = soup.select("a[href*='/model/']")
+            for card in cards:
+                if len(models) >= limit:
+                    break
+                href = card.get("href", "")
+                if not href:
+                    continue
+                # Нормализуем URL
+                if not href.startswith("http"):
+                    url = urljoin(self.BASE_URL, href.split("?")[0])
+                else:
+                    url = href.split("?")[0]
+                model_id = self._make_id(url, "cc")
+                title = card.get_text(strip=True)[:60] or "3D-модель"
+                # Ищем превью-картинку внутри карточки
+                img_el = card.select_one("img")
+                image_url = self._normalize_image_url(
+                    (img_el.get("src") or img_el.get("data-src")) if img_el else None,
+                    self.BASE_URL,
+                )
+                # Ссылка на скачивание - обычно на странице модели есть кнопка Download, но для простоты используем URL страницы
+                # Многие сайты позволяют скачать по ссылке /model/{id}/download
+                download_url = f"{url}/download" if url.endswith('/model/') else f"{url}/download"
+                models.append({
+                    "model_id": model_id,
+                    "source": self.SOURCE,
+                    "title": title,
+                    "url": url,
+                    "image_url": image_url,
+                    "download_url": download_url,
+                })
+        except Exception as e:
+            logger.error("❌ Creality Cloud: %s", e)
         return models
 
 
@@ -443,6 +490,7 @@ class AutoPoster:
             PrintablesScraper(self.http),
             ThingiverseScraper(self.http),
             MakerWorldScraper(self.http),
+            CrealityCloudScraper(self.http),  # Добавили новый парсер
         ]
 
     def find_and_post(self) -> bool:
@@ -524,7 +572,7 @@ def run_scheduler(poster: AutoPoster) -> None:
 # ═══════════════════════════════════════════════════════════════════════
 def main() -> None:
     print("═" * 60)
-    print("🚀 3D Auto Poster")
+    print("🚀 3D Auto Poster (с Creality Cloud)")
     print("═" * 60)
 
     errors = Config.validate()
