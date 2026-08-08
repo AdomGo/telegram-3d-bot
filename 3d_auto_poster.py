@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 3D Auto Poster — Telegram-бот для автоматической публикации 3D-моделей.
-Парсит Printables, Thingiverse, MakerWorld, Creality Cloud.
+Парсит Printables, Thingiverse, MakerWorld, Creality Cloud, Polyzon.
+Расписание: 6:00, 8:00, 10:00, 12:00, 14:00, 16:00, 18:00 (каждые 2 часа).
 """
 
 from __future__ import annotations
@@ -51,13 +52,13 @@ logger = logging.getLogger("3D_AutoPoster")
 class Config:
     BOT_TOKEN: str        = "8517153978:AAGNMGbzhu-saXIRqvbXMG0Vn56AbbcHxOY"
     CHANNEL_ID: str       = "@TREEDSTL"
-    POST_START_HOUR: int  = 9
-    POST_END_HOUR: int    = 21
-    POST_INTERVAL_MINUTES: int = 60
     REQUEST_TIMEOUT: int  = 30
     MAX_RETRIES: int      = 3
     PORT: int             = 10000
     MAX_DOWNLOAD_SIZE: int = 47185920
+
+    # Список часов для публикации (6:00, 8:00, ..., 18:00)
+    POST_HOURS: List[int] = [6, 8, 10, 12, 14, 16, 18]
 
     @classmethod
     def validate(cls) -> List[str]:
@@ -195,7 +196,7 @@ class DescriptionGenerator:
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# ПАРСЕРЫ
+# ПАРСЕРЫ (Printables, Thingiverse, MakerWorld, Creality Cloud, Polyzon)
 # ═══════════════════════════════════════════════════════════════════════
 class BaseScraper:
     SOURCE: str = "unknown"
@@ -350,11 +351,9 @@ class MakerWorldScraper(BaseScraper):
         return models
 
 
-# ===== НОВЫЙ ПАРСЕР: CREALITY CLOUD =====
 class CrealityCloudScraper(BaseScraper):
     SOURCE = "crealitycloud"
     BASE_URL = "https://www.crealitycloud.com"
-    # Список моделей (страница всех моделей, сортировка по новизне)
     MODELS_URL = "https://www.crealitycloud.com/models?sort=latest"
 
     def fetch_models(self, limit: int = 12) -> List[Dict[str, Any]]:
@@ -362,7 +361,6 @@ class CrealityCloudScraper(BaseScraper):
         try:
             resp = self.http.get(self.MODELS_URL)
             soup = BeautifulSoup(resp.text, "html.parser")
-            # Пробуем найти карточки моделей. Селектор может отличаться, но обычно это ссылки на /model/...
             cards = soup.select("a[href*='/model/']")
             for card in cards:
                 if len(models) >= limit:
@@ -370,21 +368,17 @@ class CrealityCloudScraper(BaseScraper):
                 href = card.get("href", "")
                 if not href:
                     continue
-                # Нормализуем URL
                 if not href.startswith("http"):
                     url = urljoin(self.BASE_URL, href.split("?")[0])
                 else:
                     url = href.split("?")[0]
                 model_id = self._make_id(url, "cc")
                 title = card.get_text(strip=True)[:60] or "3D-модель"
-                # Ищем превью-картинку внутри карточки
                 img_el = card.select_one("img")
                 image_url = self._normalize_image_url(
                     (img_el.get("src") or img_el.get("data-src")) if img_el else None,
                     self.BASE_URL,
                 )
-                # Ссылка на скачивание - обычно на странице модели есть кнопка Download, но для простоты используем URL страницы
-                # Многие сайты позволяют скачать по ссылке /model/{id}/download
                 download_url = f"{url}/download" if url.endswith('/model/') else f"{url}/download"
                 models.append({
                     "model_id": model_id,
@@ -396,6 +390,54 @@ class CrealityCloudScraper(BaseScraper):
                 })
         except Exception as e:
             logger.error("❌ Creality Cloud: %s", e)
+        return models
+
+
+class PolyzonScraper(BaseScraper):
+    SOURCE = "polyzon"
+    BASE_URL = "https://polyzon.org"
+    SEARCH_URL = "https://polyzon.org/search"
+
+    def fetch_models(self, limit: int = 12) -> List[Dict[str, Any]]:
+        models = []
+        try:
+            query = "3d"
+            url = f"{self.SEARCH_URL}?q={query}&page=1"
+            headers = self.http._base_headers()
+            headers.update({
+                "Accept": "application/json, text/plain, */*",
+                "Referer": "https://polyzon.org/",
+                "X-Requested-With": "XMLHttpRequest"
+            })
+            resp = self.http.session.get(url, headers=headers, timeout=self.http.timeout)
+            data = resp.json()
+
+            items = data.get('models', [])
+            if not items:
+                items = data.get('items', [])
+                items = data.get('results', []) if not items else items
+
+            for item in items:
+                if len(models) >= limit:
+                    break
+                title = item.get('title', '3D-модель')
+                slug = item.get('slug', '')
+                url = f"{self.BASE_URL}/model/{slug}" if slug else item.get('url', '')
+                image_url = item.get('image', '')
+                if not image_url.startswith('http'):
+                    image_url = f"{self.BASE_URL}{image_url}"
+                download_url = f"{url}/download" if url else None
+
+                models.append({
+                    "model_id": self._make_id(url, "pz"),
+                    "source": self.SOURCE,
+                    "title": title,
+                    "url": url,
+                    "image_url": image_url,
+                    "download_url": download_url,
+                })
+        except Exception as e:
+            logger.error("❌ Polyzon: %s", e)
         return models
 
 
@@ -431,7 +473,6 @@ class TelegramPublisher:
             lines.append(" ".join(hashtags))
             caption = "\n".join(lines)
 
-            # Фото
             photo_url = model.get("image_url", "")
             if photo_url:
                 await self.bot.send_photo(
@@ -447,7 +488,6 @@ class TelegramPublisher:
                     parse_mode=ParseMode.HTML,
                 )
 
-            # Файл
             download_url = model.get("download_url", "")
             if download_url:
                 content = self._download_file(download_url)
@@ -490,7 +530,8 @@ class AutoPoster:
             PrintablesScraper(self.http),
             ThingiverseScraper(self.http),
             MakerWorldScraper(self.http),
-            CrealityCloudScraper(self.http),  # Добавили новый парсер
+            CrealityCloudScraper(self.http),
+            PolyzonScraper(self.http),
         ]
 
     def find_and_post(self) -> bool:
@@ -528,7 +569,7 @@ class AutoPoster:
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# ВЕБ-СЕРВЕР
+# ВЕБ-СЕРВЕР ДЛЯ RENDER
 # ═══════════════════════════════════════════════════════════════════════
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
@@ -548,20 +589,22 @@ def run_webserver(port: int) -> None:
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# ПЛАНИРОВЩИК
+# ПЛАНИРОВЩИК (НОВОЕ РАСПИСАНИЕ)
 # ═══════════════════════════════════════════════════════════════════════
 def job(poster: AutoPoster) -> None:
     now = datetime.now()
-    if Config.POST_START_HOUR <= now.hour <= Config.POST_END_HOUR:
-        logger.info("⏰ Запуск публикации по расписанию...")
-        poster.find_and_post()
-    else:
-        logger.info("⏸ Пропуск: вне диапазона %d:00–%d:00", Config.POST_START_HOUR, Config.POST_END_HOUR)
+    # Запуск публикации только в заданные часы (уже проверено в расписании, но на всякий случай)
+    logger.info(f"⏰ Запуск публикации по расписанию ({now.strftime('%H:%M')})")
+    poster.find_and_post()
 
 
 def run_scheduler(poster: AutoPoster) -> None:
-    schedule.every().hour.at(":00").do(job, poster)
-    logger.info("📅 Планировщик запущен (9:00–21:00)")
+    # Устанавливаем расписание для каждого часа из списка POST_HOURS
+    for hour in Config.POST_HOURS:
+        schedule.every().day.at(f"{hour:02d}:00").do(job, poster)
+    
+    logger.info(f"📅 Планировщик запущен. Публикации в {', '.join(str(h) for h in Config.POST_HOURS)}:00")
+    
     while True:
         schedule.run_pending()
         time.sleep(30)
@@ -572,7 +615,7 @@ def run_scheduler(poster: AutoPoster) -> None:
 # ═══════════════════════════════════════════════════════════════════════
 def main() -> None:
     print("═" * 60)
-    print("🚀 3D Auto Poster (с Creality Cloud)")
+    print("🚀 3D Auto Poster (расписание 6:00–18:00, каждые 2 часа)")
     print("═" * 60)
 
     errors = Config.validate()
